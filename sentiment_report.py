@@ -1,123 +1,143 @@
 """
-Daily forex/gold sentiment report -> Telegram bot.
+Daily EUR & Gold positioning report -> Telegram bot.
 
-What it does:
-1. Fetches retail trader positioning (Long % / Short %) for EURUSD and
-   XAUUSD from Myfxbook's public Community Outlook page.
-2. Formats a short summary message.
-3. Sends it to your Telegram chat via the Telegram Bot API.
+Data source: the U.S. CFTC's public "Commitments of Traders" (COT) Socrata
+API (publicreporting.cftc.gov). This is an official, free, no-key-required
+government data feed — no scraping, no bot-detection issues, safe to call
+from any server including GitHub Actions.
+
+Important caveat: the CFTC publishes this report ONCE A WEEK (Friday,
+covering the prior Tuesday's positions), not daily. So on most days this
+message will show the same figures as the previous day, with a new
+"as of" date only appearing once a week. That's a limitation of using a
+free, official source instead of paid intraday retail-sentiment feeds.
+
+What "consensus" means here: the % of Non-Commercial (large speculative)
+traders' futures positions that are Long vs Short, for:
+  - EUR FX  (contract: EURO FX - CHICAGO MERCANTILE EXCHANGE)
+  - GOLD    (contract: GOLD - COMMODITY EXCHANGE INC.)
+from the Legacy Futures-Only COT report (dataset id 6dca-aqww).
 
 Requirements (installed automatically by the GitHub Actions workflow):
-    pip install requests beautifulsoup4
+    pip install requests
 
 Environment variables required:
     TELEGRAM_BOT_TOKEN  - token from @BotFather
     TELEGRAM_CHAT_ID    - your personal or group chat id
 
 NOTE ON RELIABILITY:
-Myfxbook does not offer a free public API for this data, so this script
-scrapes the public per-symbol Myfxbook outlook pages (e.g.
-myfxbook.com/community/outlook/EURUSD), reading the plain-text summary
-sentence on each page ("NN% ... going short ... NN% ... going long").
-If Myfxbook changes that wording, `SENTIMENT_PATTERN` in this file will
-need to be updated to match the new phrasing.
+If CFTC ever renames a contract or restructures this dataset, the
+MARKET_NAMES below (or the fallback CONTAINS filter) may need updating.
 """
 
 import os
-import re
 import sys
 from datetime import datetime, timezone
 
 import requests
-from bs4 import BeautifulSoup
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
-SYMBOLS = ["EURUSD", "XAUUSD"]
+CFTC_DATASET_URL = "https://publicreporting.cftc.gov/resource/6dca-aqww.json"
 
-# Myfxbook's aggregate /community/outlook page is rendered client-side (JS),
-# so it has no static table to scrape. Each symbol's own page, however,
-# includes a plain-text summary sentence like:
-#   "60% of the forex traders are currently going short with EUR/USD,
-#    ... meanwhile 40% ... are going long with EUR/USD, ..."
-# That sentence is what we parse — it's simpler and more stable than the
-# HTML table markup on the same page.
-SYMBOL_URL_TEMPLATE = "https://www.myfxbook.com/community/outlook/{symbol}"
-
-SENTIMENT_PATTERN = re.compile(
-    r"(\d+)\s*%\s*of the forex traders are currently going short.*?"
-    r"(\d+)\s*%\s*of the forex traders are going long",
-    re.IGNORECASE | re.DOTALL,
-)
+# Display label -> (exact market_and_exchange_names value, fallback substring)
+MARKETS = {
+    "EURUSD (EUR FX)": (
+        "EURO FX - CHICAGO MERCANTILE EXCHANGE",
+        "EURO FX",
+    ),
+    "XAUUSD (GOLD)": (
+        "GOLD - COMMODITY EXCHANGE INC.",
+        "GOLD",
+    ),
+}
 
 
-def fetch_symbol_sentiment(symbol: str) -> tuple:
+def fetch_latest_report(exact_name: str, fallback_substring: str) -> dict:
     """
-    Fetches one symbol's Myfxbook outlook page and extracts (long_pct, short_pct)
-    from the plain-text summary sentence on the page.
-    Raises RuntimeError if the sentence can't be found (site structure changed).
+    Queries the CFTC Socrata API for the most recent Legacy Futures-Only
+    COT report row for a given market. Tries an exact name match first;
+    if that returns nothing (e.g. CFTC tweaked the exact string), falls
+    back to a substring match on market_and_exchange_names.
+    Returns the raw record dict, or raises RuntimeError if nothing found.
     """
-    url = SYMBOL_URL_TEMPLATE.format(symbol=symbol)
-    headers = {"User-Agent": "Mozilla/5.0 (compatible; DailySentimentBot/1.0)"}
-    resp = requests.get(url, headers=headers, timeout=20)
+    headers = {"Accept": "application/json"}
+
+    # Attempt 1: exact match
+    params = {
+        "$where": f"market_and_exchange_names='{exact_name}'",
+        "$order": "report_date_as_yyyy_mm_dd DESC",
+        "$limit": 1,
+    }
+    resp = requests.get(CFTC_DATASET_URL, params=params, headers=headers, timeout=20)
     resp.raise_for_status()
+    rows = resp.json()
 
-    soup = BeautifulSoup(resp.text, "html.parser")
-    page_text = soup.get_text(" ", strip=True)
+    if not rows:
+        # Attempt 2: fallback substring match
+        params = {
+            "$where": f"market_and_exchange_names like '%25{fallback_substring}%25'",
+            "$order": "report_date_as_yyyy_mm_dd DESC",
+            "$limit": 1,
+        }
+        resp = requests.get(CFTC_DATASET_URL, params=params, headers=headers, timeout=20)
+        resp.raise_for_status()
+        rows = resp.json()
 
-    match = SENTIMENT_PATTERN.search(page_text)
-    if not match:
+    if not rows:
         raise RuntimeError(
-            f"Could not find the sentiment sentence for {symbol} — "
-            "Myfxbook may have changed their page wording/structure."
+            f"No CFTC rows found for '{exact_name}' (or substring '{fallback_substring}') — "
+            "CFTC may have renamed this contract."
         )
-
-    short_pct = float(match.group(1))
-    long_pct = float(match.group(2))
-    return long_pct, short_pct
+    return rows[0]
 
 
-def fetch_myfxbook_outlook() -> dict:
+def fetch_all_markets() -> dict:
     """
-    Returns {symbol: (long_pct, short_pct)} for every symbol in SYMBOLS.
-    A symbol is simply omitted from the result if it couldn't be fetched —
-    the caller reports "no data" for that symbol rather than failing entirely.
+    Returns {label: (long_pct, short_pct, report_date)} for every market in
+    MARKETS. A market is omitted from the result if it couldn't be fetched.
     """
     results = {}
-    for symbol in SYMBOLS:
+    for label, (exact_name, fallback_substring) in MARKETS.items():
         try:
-            results[symbol] = fetch_symbol_sentiment(symbol)
+            row = fetch_latest_report(exact_name, fallback_substring)
+            long_n = float(row["noncomm_positions_long_all"])
+            short_n = float(row["noncomm_positions_short_all"])
+            total = long_n + short_n
+            if total == 0:
+                raise RuntimeError("long+short positions are both zero")
+            long_pct = 100 * long_n / total
+            short_pct = 100 * short_n / total
+            report_date = row.get("report_date_as_yyyy_mm_dd", "")[:10]
+            results[label] = (long_pct, short_pct, report_date)
         except Exception as exc:  # noqa: BLE001
-            print(f"Warning: failed to fetch {symbol}: {exc}", file=sys.stderr)
+            print(f"Warning: failed to fetch {label}: {exc}", file=sys.stderr)
     return results
 
 
 def build_message(data: dict) -> str:
     today = datetime.now(timezone.utc).strftime("%d.%m.%Y")
-    lines = [f"\U0001F4CA Консенсус трейдеров на {today} (UTC)\n"]
+    lines = [f"\U0001F4CA Консенсус крупных трейдеров на {today} (UTC)\n"]
+    lines.append("Источник: CFTC Commitment of Traders (данные обновляются раз в неделю, по пятницам)\n")
 
     if not data:
         lines.append(
-            "Не удалось получить данные сегодня — источник мог изменить структуру страницы. "
-            "Проверьте лог workflow на GitHub."
+            "Не удалось получить данные сегодня. Проверьте лог workflow на GitHub."
         )
         return "\n".join(lines)
 
-    for symbol in SYMBOLS:
-        if symbol in data:
-            long_pct, short_pct = data[symbol]
-            bias = "большинство LONG" if long_pct > short_pct else "большинство SHORT"
-            lines.append(
-                f"{symbol}: Long {long_pct:.0f}% / Short {short_pct:.0f}%  ({bias})"
-            )
-        else:
-            lines.append(f"{symbol}: нет данных")
+    for label, (long_pct, short_pct, report_date) in data.items():
+        bias = "большинство LONG" if long_pct > short_pct else "большинство SHORT"
+        lines.append(
+            f"{label}: Long {long_pct:.0f}% / Short {short_pct:.0f}%  ({bias})\n"
+            f"  (по состоянию на {report_date})"
+        )
 
     lines.append(
-        "\n\u26A0\uFE0F Это розничный (retail) консенсус трейдеров, а не торговый сигнал. "
-        "Розничная толпа нередко ошибается на разворотах — используйте как один из "
-        "контекстных факторов, а не как самостоятельный триггер для сделки."
+        "\n\u26A0\uFE0F Это позиционирование крупных спекулянтов (non-commercial) по фьючерсам, "
+        "не торговый сигнал и не гарантия направления цены — используйте как один из "
+        "контекстных факторов."
     )
     return "\n".join(lines)
 
@@ -135,12 +155,7 @@ def send_telegram_message(text: str) -> None:
 
 
 def main() -> None:
-    try:
-        data = fetch_myfxbook_outlook()
-    except Exception as exc:  # noqa: BLE001 - we want to report any failure, then still notify
-        print(f"Error fetching sentiment data: {exc}", file=sys.stderr)
-        data = {}
-
+    data = fetch_all_markets()
     message = build_message(data)
     send_telegram_message(message)
     print("Report sent.")
