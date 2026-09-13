@@ -1,16 +1,18 @@
-name: Daily Forex Sentiment Report
+name: Weekly CFTC Positioning Report
 
 on:
   schedule:
-    # Runs every day at 06:00 UTC.
-    # Adjust the hour to fit your timezone / preferred wake-up time.
-    # (Helsinki is UTC+2 in winter / UTC+3 in summer, so 06:00 UTC = 08:00-09:00 local.)
-    - cron: '0 6 * * *'
+    # CFTC publishes the Commitments of Traders report every Friday at
+    # 3:30pm US Eastern time. 20:30 UTC is safely after that release
+    # year-round (whether US is on EST or EDT).
+    - cron: '30 20 * * 5'
   workflow_dispatch: {}   # lets you trigger it manually from the Actions tab to test
 
 jobs:
   send-report:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write   # needed to commit the "last sent date" state file back
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -28,3 +30,17 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python sentiment_report.py
+
+      - name: Save "last sent" state back to the repo
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add last_report_date.txt
+          # Only commit if the file actually changed (e.g. the run was
+          # skipped because there was no new report yet).
+          if ! git diff --cached --quiet; then
+            git commit -m "Update last sent CFTC report date"
+            git push
+          else
+            echo "No change to last_report_date.txt — nothing to commit."
+          fi
