@@ -28,6 +28,15 @@ Environment variables required:
 NOTE ON RELIABILITY:
 If CFTC ever renames a contract or restructures this dataset, the
 MARKET_NAMES below (or the fallback CONTAINS filter) may need updating.
+
+STATE FILE:
+The script keeps a small local file (STATE_FILE) recording the report
+date of the last message it actually sent. Before sending, it checks
+the freshest report date from CFTC against this file — if there's no
+new report yet (e.g. CFTC delayed publication for a US holiday), it
+skips sending and exits quietly instead of re-sending stale data. The
+GitHub Actions workflow commits this file back to the repo after each
+run so the "last sent" state persists between scheduled runs.
 """
 
 import os
@@ -40,6 +49,7 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
 CFTC_DATASET_URL = "https://publicreporting.cftc.gov/resource/6dca-aqww.json"
+STATE_FILE = "last_report_date.txt"
 
 # Display label -> (exact market_and_exchange_names value, fallback substring)
 MARKETS = {
@@ -52,6 +62,21 @@ MARKETS = {
         "GOLD",
     ),
 }
+
+
+def read_last_sent_date() -> str:
+    """Returns the report_date of the last successfully sent message,
+    or an empty string if the state file doesn't exist yet (first run)."""
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except FileNotFoundError:
+        return ""
+
+
+def write_last_sent_date(report_date: str) -> None:
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
+        f.write(report_date)
 
 
 def fetch_latest_two_reports(exact_name: str, fallback_substring: str) -> list:
@@ -216,9 +241,27 @@ def send_telegram_message(text: str) -> None:
 
 def main() -> None:
     data = fetch_all_markets()
+
+    if not data:
+        print("No data fetched for any market; nothing to send.", file=sys.stderr)
+        return
+
+    # All markets come from the same weekly CFTC report, so their report
+    # dates should match. Use the newest one found as "the" report date.
+    latest_report_date = max(values[2] for values in data.values())
+
+    last_sent_date = read_last_sent_date()
+    if latest_report_date and latest_report_date == last_sent_date:
+        print(
+            f"Latest CFTC report ({latest_report_date}) was already sent — "
+            "no new data yet, skipping Telegram message."
+        )
+        return
+
     message = build_message(data)
     send_telegram_message(message)
-    print("Report sent.")
+    write_last_sent_date(latest_report_date)
+    print(f"Report sent for {latest_report_date}.")
 
 
 if __name__ == "__main__":
