@@ -54,32 +54,31 @@ MARKETS = {
 }
 
 
-def fetch_latest_report(exact_name: str, fallback_substring: str) -> dict:
+def fetch_latest_two_reports(exact_name: str, fallback_substring: str) -> list:
     """
-    Queries the CFTC Socrata API for the most recent Legacy Futures-Only
-    COT report row for a given market. Tries an exact name match first;
-    if that returns nothing (e.g. CFTC tweaked the exact string), falls
-    back to a substring match on market_and_exchange_names.
-    Returns the raw record dict, or raises RuntimeError if nothing found.
+    Queries the CFTC Socrata API for the two most recent Legacy
+    Futures-Only COT report rows for a given market (current + previous
+    week), so we can compute a week-over-week change.
+    Tries an exact name match first; falls back to a substring match.
+    Returns a list of raw record dicts (newest first), or raises
+    RuntimeError if nothing found.
     """
     headers = {"Accept": "application/json"}
 
-    # Attempt 1: exact match
     params = {
         "$where": f"market_and_exchange_names='{exact_name}'",
         "$order": "report_date_as_yyyy_mm_dd DESC",
-        "$limit": 1,
+        "$limit": 2,
     }
     resp = requests.get(CFTC_DATASET_URL, params=params, headers=headers, timeout=20)
     resp.raise_for_status()
     rows = resp.json()
 
     if not rows:
-        # Attempt 2: fallback substring match
         params = {
             "$where": f"market_and_exchange_names like '%25{fallback_substring}%25'",
             "$order": "report_date_as_yyyy_mm_dd DESC",
-            "$limit": 1,
+            "$limit": 2,
         }
         resp = requests.get(CFTC_DATASET_URL, params=params, headers=headers, timeout=20)
         resp.raise_for_status()
@@ -90,27 +89,63 @@ def fetch_latest_report(exact_name: str, fallback_substring: str) -> dict:
             f"No CFTC rows found for '{exact_name}' (or substring '{fallback_substring}') — "
             "CFTC may have renamed this contract."
         )
-    return rows[0]
+    return rows
+
+
+def _pct_long_short(row: dict) -> tuple:
+    long_n = float(row["noncomm_positions_long_all"])
+    short_n = float(row["noncomm_positions_short_all"])
+    total = long_n + short_n
+    if total == 0:
+        raise RuntimeError("long+short positions are both zero")
+    return 100 * long_n / total, 100 * short_n / total
 
 
 def fetch_all_markets() -> dict:
     """
-    Returns {label: (long_pct, short_pct, report_date)} for every market in
-    MARKETS. A market is omitted from the result if it couldn't be fetched.
+    Returns {label: (long_pct, short_pct, report_date, long_pct_change,
+    long_contract_change, short_contract_change)} for every market in
+    MARKETS. long_pct_change is the change in Long % vs the previous
+    week (None if unavailable). long/short_contract_change are the raw
+    week-over-week contract changes as published directly by CFTC
+    (fields change_in_noncomm_long_all / change_in_noncomm_short_all).
+    A market is omitted from the result if it couldn't be fetched.
     """
     results = {}
     for label, (exact_name, fallback_substring) in MARKETS.items():
         try:
-            row = fetch_latest_report(exact_name, fallback_substring)
-            long_n = float(row["noncomm_positions_long_all"])
-            short_n = float(row["noncomm_positions_short_all"])
-            total = long_n + short_n
-            if total == 0:
-                raise RuntimeError("long+short positions are both zero")
-            long_pct = 100 * long_n / total
-            short_pct = 100 * short_n / total
-            report_date = row.get("report_date_as_yyyy_mm_dd", "")[:10]
-            results[label] = (long_pct, short_pct, report_date)
+            rows = fetch_latest_two_reports(exact_name, fallback_substring)
+            current = rows[0]
+            long_pct, short_pct = _pct_long_short(current)
+            report_date = current.get("report_date_as_yyyy_mm_dd", "")[:10]
+
+            long_pct_change = None
+            if len(rows) > 1:
+                try:
+                    prev_long_pct, _ = _pct_long_short(rows[1])
+                    long_pct_change = long_pct - prev_long_pct
+                except Exception:  # noqa: BLE001
+                    long_pct_change = None
+
+            # CFTC publishes these week-over-week contract deltas directly,
+            # computed by CFTC itself from the raw position counts.
+            long_contract_change = current.get("change_in_noncomm_long_all")
+            short_contract_change = current.get("change_in_noncomm_short_all")
+            long_contract_change = (
+                int(long_contract_change) if long_contract_change not in (None, "") else None
+            )
+            short_contract_change = (
+                int(short_contract_change) if short_contract_change not in (None, "") else None
+            )
+
+            results[label] = (
+                long_pct,
+                short_pct,
+                report_date,
+                long_pct_change,
+                long_contract_change,
+                short_contract_change,
+            )
         except Exception as exc:  # noqa: BLE001
             print(f"Warning: failed to fetch {label}: {exc}", file=sys.stderr)
     return results
@@ -127,11 +162,36 @@ def build_message(data: dict) -> str:
         )
         return "\n".join(lines)
 
-    for label, (long_pct, short_pct, report_date) in data.items():
+    for label, values in data.items():
+        (
+            long_pct,
+            short_pct,
+            report_date,
+            long_pct_change,
+            long_contract_change,
+            short_contract_change,
+        ) = values
         bias = "большинство LONG" if long_pct > short_pct else "большинство SHORT"
+
+        if long_pct_change is None:
+            change_text = "изменение доли недоступно (нет данных за пред. неделю)"
+        elif abs(long_pct_change) < 0.5:
+            change_text = "доля почти не изменилась к пред. неделе"
+        else:
+            direction = "рост доли LONG" if long_pct_change > 0 else "рост доли SHORT"
+            change_text = f"{direction} на {abs(long_pct_change):.1f} п.п. к пред. неделе"
+
+        def fmt_contract_change(value):
+            if value is None:
+                return "н/д"
+            sign = "+" if value > 0 else ""
+            return f"{sign}{value:,}".replace(",", " ")
+
         lines.append(
             f"{label}: Long {long_pct:.0f}% / Short {short_pct:.0f}%  ({bias})\n"
-            f"  (по состоянию на {report_date})"
+            f"  (по состоянию на {report_date}, {change_text})\n"
+            f"  Изменение контрактов за неделю: Long {fmt_contract_change(long_contract_change)}, "
+            f"Short {fmt_contract_change(short_contract_change)}"
         )
 
     lines.append(
