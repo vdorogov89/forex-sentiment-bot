@@ -16,12 +16,15 @@ Environment variables required:
 
 NOTE ON RELIABILITY:
 Myfxbook does not offer a free public API for this data, so this script
-scrapes their public "Community Outlook" HTML page. If Myfxbook changes
-the structure of that page, the parsing in `fetch_myfxbook_outlook()`
-will need to be updated (look for the table with retail long/short %).
+scrapes the public per-symbol Myfxbook outlook pages (e.g.
+myfxbook.com/community/outlook/EURUSD), reading the plain-text summary
+sentence on each page ("NN% ... going short ... NN% ... going long").
+If Myfxbook changes that wording, `SENTIMENT_PATTERN` in this file will
+need to be updated to match the new phrasing.
 """
 
 import os
+import re
 import sys
 from datetime import datetime, timezone
 
@@ -33,43 +36,60 @@ CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
 SYMBOLS = ["EURUSD", "XAUUSD"]
 
-OUTLOOK_URL = "https://www.myfxbook.com/community/outlook"
+# Myfxbook's aggregate /community/outlook page is rendered client-side (JS),
+# so it has no static table to scrape. Each symbol's own page, however,
+# includes a plain-text summary sentence like:
+#   "60% of the forex traders are currently going short with EUR/USD,
+#    ... meanwhile 40% ... are going long with EUR/USD, ..."
+# That sentence is what we parse — it's simpler and more stable than the
+# HTML table markup on the same page.
+SYMBOL_URL_TEMPLATE = "https://www.myfxbook.com/community/outlook/{symbol}"
+
+SENTIMENT_PATTERN = re.compile(
+    r"(\d+)\s*%\s*of the forex traders are currently going short.*?"
+    r"(\d+)\s*%\s*of the forex traders are going long",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def fetch_symbol_sentiment(symbol: str) -> tuple:
+    """
+    Fetches one symbol's Myfxbook outlook page and extracts (long_pct, short_pct)
+    from the plain-text summary sentence on the page.
+    Raises RuntimeError if the sentence can't be found (site structure changed).
+    """
+    url = SYMBOL_URL_TEMPLATE.format(symbol=symbol)
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; DailySentimentBot/1.0)"}
+    resp = requests.get(url, headers=headers, timeout=20)
+    resp.raise_for_status()
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+    page_text = soup.get_text(" ", strip=True)
+
+    match = SENTIMENT_PATTERN.search(page_text)
+    if not match:
+        raise RuntimeError(
+            f"Could not find the sentiment sentence for {symbol} — "
+            "Myfxbook may have changed their page wording/structure."
+        )
+
+    short_pct = float(match.group(1))
+    long_pct = float(match.group(2))
+    return long_pct, short_pct
 
 
 def fetch_myfxbook_outlook() -> dict:
     """
-    Scrapes the public Myfxbook Community Outlook page.
-    Returns {symbol: (long_pct, short_pct)} for the symbols we care about.
-    Raises RuntimeError if the page structure isn't what we expect.
+    Returns {symbol: (long_pct, short_pct)} for every symbol in SYMBOLS.
+    A symbol is simply omitted from the result if it couldn't be fetched —
+    the caller reports "no data" for that symbol rather than failing entirely.
     """
-    headers = {"User-Agent": "Mozilla/5.0 (compatible; DailySentimentBot/1.0)"}
-    resp = requests.get(OUTLOOK_URL, headers=headers, timeout=20)
-    resp.raise_for_status()
-
-    soup = BeautifulSoup(resp.text, "html.parser")
     results = {}
-
-    # Myfxbook renders the outlook data in a table. We look for rows that
-    # start with one of our target symbols and contain two percentage cells.
-    for row in soup.find_all("tr"):
-        cells = row.find_all("td")
-        if len(cells) < 3:
-            continue
-        symbol_text = cells[0].get_text(strip=True).upper().replace(" ", "")
-        for sym in SYMBOLS:
-            if sym in symbol_text:
-                long_text = cells[1].get_text(strip=True).replace("%", "")
-                short_text = cells[2].get_text(strip=True).replace("%", "")
-                try:
-                    results[sym] = (float(long_text), float(short_text))
-                except ValueError:
-                    pass
-
-    if not results:
-        raise RuntimeError(
-            "Could not parse any symbols from the Myfxbook outlook page — "
-            "the page structure has likely changed and the script needs updating."
-        )
+    for symbol in SYMBOLS:
+        try:
+            results[symbol] = fetch_symbol_sentiment(symbol)
+        except Exception as exc:  # noqa: BLE001
+            print(f"Warning: failed to fetch {symbol}: {exc}", file=sys.stderr)
     return results
 
 
