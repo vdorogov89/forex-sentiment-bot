@@ -40,6 +40,7 @@ run so the "last sent" state persists between scheduled runs.
 """
 
 import os
+import time
 import sys
 from datetime import datetime, timezone
 
@@ -55,11 +56,39 @@ STATE_FILE = "last_report_date.txt"
 MARKETS = {
     "EURUSD (EUR FX)": (
         "EURO FX - CHICAGO MERCANTILE EXCHANGE",
-        "EURO FX",
+        "EURO FX - CHICAGO",
+    ),
+    "GBPUSD (GBP FX)": (
+        "BRITISH POUND - CHICAGO MERCANTILE EXCHANGE",
+        "BRITISH POUND - CHICAGO",
+    ),
+    "JPY, йена (пара USDJPY)*": (
+        "JAPANESE YEN - CHICAGO MERCANTILE EXCHANGE",
+        "JAPANESE YEN - CHICAGO",
+    ),
+    "CHF, франк (пара USDCHF)*": (
+        "SWISS FRANC - CHICAGO MERCANTILE EXCHANGE",
+        "SWISS FRANC - CHICAGO",
+    ),
+    "AUDUSD (AUD FX)": (
+        "AUSTRALIAN DOLLAR - CHICAGO MERCANTILE EXCHANGE",
+        "AUSTRALIAN DOLLAR - CHICAGO",
+    ),
+    "CAD, кан. доллар (пара USDCAD)*": (
+        "CANADIAN DOLLAR - CHICAGO MERCANTILE EXCHANGE",
+        "CANADIAN DOLLAR - CHICAGO",
     ),
     "XAUUSD (GOLD)": (
         "GOLD - COMMODITY EXCHANGE INC.",
-        "GOLD",
+        "GOLD - COMMODITY EXCHANGE",
+    ),
+    "BTC (CME)**": (
+        "BITCOIN - CHICAGO MERCANTILE EXCHANGE",
+        "BITCOIN - CHICAGO MERCANTILE",
+    ),
+    "ETH (CME)**": (
+        "ETHER CASH SETTLED - CHICAGO MERCANTILE EXCHANGE",
+        "ETHER CASH SETTLED - CHICAGO",
     ),
 }
 
@@ -79,7 +108,7 @@ def write_last_sent_date(report_date: str) -> None:
         f.write(report_date)
 
 
-def fetch_latest_two_reports(exact_name: str, fallback_substring: str) -> list:
+def _fetch_latest_two_reports_once(exact_name: str, fallback_substring: str) -> list:
     """
     Queries the CFTC Socrata API for the two most recent Legacy
     Futures-Only COT report rows for a given market (current + previous
@@ -117,6 +146,23 @@ def fetch_latest_two_reports(exact_name: str, fallback_substring: str) -> list:
     return rows
 
 
+def fetch_latest_two_reports(exact_name: str, fallback_substring: str, attempts: int = 3) -> list:
+    """Same as _fetch_latest_two_reports_once, but retries on network/API
+    errors (CFTC's API is occasionally slow or returns 5xx), so one bad
+    request doesn't silently drop a market from the report."""
+    last_exc = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return _fetch_latest_two_reports_once(exact_name, fallback_substring)
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            print(f"Warning: CFTC fetch for '{exact_name}' failed (attempt {attempt}/{attempts}): {exc}",
+                  file=sys.stderr)
+            if attempt < attempts:
+                time.sleep(5 * attempt)
+    raise last_exc
+
+
 def _pct_long_short(row: dict) -> tuple:
     long_n = float(row["noncomm_positions_long_all"])
     short_n = float(row["noncomm_positions_short_all"])
@@ -126,7 +172,7 @@ def _pct_long_short(row: dict) -> tuple:
     return 100 * long_n / total, 100 * short_n / total
 
 
-def fetch_all_markets() -> dict:
+def fetch_all_markets(only: list = None) -> dict:
     """
     Returns {label: (long_pct, short_pct, report_date, long_pct_change,
     long_contract_change, short_contract_change)} for every market in
@@ -138,6 +184,8 @@ def fetch_all_markets() -> dict:
     """
     results = {}
     for label, (exact_name, fallback_substring) in MARKETS.items():
+        if only is not None and label not in only:
+            continue
         try:
             rows = fetch_latest_two_reports(exact_name, fallback_substring)
             current = rows[0]
@@ -176,7 +224,7 @@ def fetch_all_markets() -> dict:
     return results
 
 
-def build_message(data: dict) -> str:
+def build_message(data: dict, missing: list = None) -> str:
     today = datetime.now(timezone.utc).strftime("%d.%m.%Y")
     lines = [f"\U0001F4CA Консенсус крупных трейдеров на {today} (UTC)\n"]
     lines.append("Источник: CFTC Commitment of Traders (данные обновляются раз в неделю, по пятницам)\n")
@@ -219,6 +267,25 @@ def build_message(data: dict) -> str:
             f"Short {fmt_contract_change(short_contract_change)}"
         )
 
+    if missing:
+        lines.append(
+            "\n\u274C Не удалось получить данные: " + ", ".join(missing)
+            + ". Запустите workflow вручную чуть позже (Actions → Run workflow), отчёт придёт полностью."
+        )
+
+    shown = list(data.keys())
+    if any(label.endswith("*") and not label.endswith("**") for label in shown):
+        lines.append(
+            "\n* Это позиции по фьючерсу на саму валюту: Long = ставка на рост валюты, "
+            "то есть против покупки пары (USDJPY/USDCHF/USDCAD вниз). "
+            "Для продажи пары большинство Long — «с большинством»."
+        )
+    if any(label.endswith("**") for label in shown):
+        lines.append(
+            "** Крипто: у non-commercial много базисных сделок (покупка спота против шорта фьючерса), "
+            "поэтому перекос Long/Short здесь слабее связан с ожиданием цены, чем по валютам."
+        )
+
     lines.append(
         "\n\u26A0\uFE0F Это позиционирование крупных спекулянтов (non-commercial) по фьючерсам, "
         "не торговый сигнал и не гарантия направления цены — используйте как один из "
@@ -242,26 +309,42 @@ def send_telegram_message(text: str) -> None:
 def main() -> None:
     data = fetch_all_markets()
 
+    # A market that failed to load must not vanish silently. Try the missing
+    # ones again (the CFTC API is flaky for a minute or two at a time).
+    for _ in range(2):
+        missing = [label for label in MARKETS if label not in data]
+        if not missing:
+            break
+        time.sleep(30)
+        data.update(fetch_all_markets(only=missing))
+    missing = [label for label in MARKETS if label not in data]
+
     if not data:
         print("No data fetched for any market; nothing to send.", file=sys.stderr)
-        return
+        sys.exit(1)
 
     # All markets come from the same weekly CFTC report, so their report
     # dates should match. Use the newest one found as "the" report date.
     latest_report_date = max(values[2] for values in data.values())
 
     last_sent_date = read_last_sent_date()
-    if latest_report_date and latest_report_date == last_sent_date:
+    force = os.environ.get("FORCE_SEND") == "1"
+    if latest_report_date and latest_report_date == last_sent_date and not force:
         print(
             f"Latest CFTC report ({latest_report_date}) was already sent — "
             "no new data yet, skipping Telegram message."
         )
         return
 
-    message = build_message(data)
+    message = build_message(data, missing)
     send_telegram_message(message)
-    write_last_sent_date(latest_report_date)
-    print(f"Report sent for {latest_report_date}.")
+    if missing:
+        # Deliberately NOT marking this report as sent: a manual re-run (or the
+        # next scheduled run) should be able to deliver the complete report.
+        print(f"Report sent for {latest_report_date} WITHOUT: {missing}; state not updated.")
+    else:
+        write_last_sent_date(latest_report_date)
+        print(f"Report sent for {latest_report_date}.")
 
 
 if __name__ == "__main__":
