@@ -55,6 +55,9 @@ SYMBOL_MAP = {
     "AVGO": "#AVGO",
     "GOOGL": "#GOOGL",
     "MSTR": "#MSTR",
+    "AMZN": "#AMZN",
+    "LCO": "#LCO",
+    "GBPUSD": "GBPUSDrfd",
 }
 
 DATE_FORMATS = ("%d.%m.%Y", "%Y-%m-%d", "%d/%m/%Y", "%m/%d/%Y")
