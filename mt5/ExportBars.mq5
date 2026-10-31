@@ -17,7 +17,7 @@
 #property script_show_inputs
 #property strict
 
-input string   InpSymbols = "XAUUSDrfd,EURUSDrfd,USDCHFrfd,#NDX,#AVGO"; // comma-separated, exactly as in Market Watch
+input string   InpSymbols = "XAUUSDrfd,EURUSDrfd,USDCHFrfd,GBPUSDrfd,#NDX,#AVGO,#MSTR,#GOOGL,#AMZN,#LCO"; // comma-separated, exactly as in Market Watch
 input datetime InpFrom    = D'2026.07.25 00:00';                       // start of export
 input datetime InpTo      = 0;                                         // 0 = now
 input bool     InpCleanOld = true;                                         // delete old bars_*.csv before exporting
