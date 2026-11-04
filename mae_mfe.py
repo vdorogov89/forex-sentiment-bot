@@ -46,6 +46,8 @@ import os
 import sys
 from datetime import datetime, timedelta
 
+import regime as regime_mod
+
 # Journal "Instrument" -> MT5 symbol exported by ExportBars.mq5
 SYMBOL_MAP = {
     "XAUUSD": "XAUUSDrfd",
@@ -271,7 +273,7 @@ def main():
     if not trades:
         sys.exit("Нет сделок: укажите --journal и/или --extra.")
 
-    cache, results = {}, []
+    cache, results, ind_cache = {}, [], {}
     for tr in trades:
         sym = SYMBOL_MAP.get(tr["instrument"], tr["instrument"])
         path = os.path.join(args.bars_dir, f"bars_{sym}.csv")
@@ -285,6 +287,9 @@ def main():
         if res is None:
             notes.append(f"{tr['label']}: в файле баров нет данных за период сделки")
             continue
+        if sym not in ind_cache:
+            ind_cache[sym] = regime_mod.build_indicators(path)
+        res["regime"], res["trend_dir"], _s, _r = regime_mod.regime_at(ind_cache[sym], tr["open_dt"], tr["direction"])
         results.append((tr, res))
 
     print(f"{'Сделка':32} {'MFE_R':>7} {'MAE_R':>7} {'MFE%':>7} {'MAE%':>7} {'Захват':>7}  Когда (ч от входа)")
@@ -292,17 +297,17 @@ def main():
         cap = fmt(r.get("capture") * 100 if r.get("capture") is not None else None, 0, "%")
         print(f"{tr['label']:32} {fmt(r['mfe_r']):>7} {fmt(r['mae_r']):>7} "
               f"{fmt(r['mfe_pct']):>7} {fmt(r['mae_pct']):>7} {cap:>7}  "
-              f"MFE {r['t_mfe_h']:.1f} / MAE {r['t_mae_h']:.1f}")
+              f"MFE {r['t_mfe_h']:.1f} / MAE {r['t_mae_h']:.1f}  {r['regime']} {r['trend_dir']}")
     for n in notes:
         print("!", n)
 
     with open(args.out, "w", encoding="utf-8", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["trade", "MAE_R", "MFE_R", "MAE_Pct", "MFE_Pct", "capture_pct", "hours_to_MFE", "hours_to_MAE"])
+        w.writerow(["trade", "MAE_R", "MFE_R", "MAE_Pct", "MFE_Pct", "capture_pct", "hours_to_MFE", "hours_to_MAE", "Regime", "Trend_Dir"])
         for tr, r in results:
             w.writerow([tr["label"], fmt(r["mae_r"]), fmt(r["mfe_r"]), fmt(r["mae_pct"]), fmt(r["mfe_pct"]),
                         fmt(r["capture"] * 100 if r.get("capture") is not None else None, 0),
-                        fmt(r["t_mfe_h"], 1), fmt(r["t_mae_h"], 1)])
+                        fmt(r["t_mfe_h"], 1), fmt(r["t_mae_h"], 1), r["regime"], r["trend_dir"]])
     print(f"\nГотово: {args.out}")
 
 
