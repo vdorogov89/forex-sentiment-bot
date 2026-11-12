@@ -134,7 +134,7 @@ def load_bars(path):
 # Core calculation
 # ---------------------------------------------------------------------
 
-def excursions(bars, direction, entry, open_dt, close_dt):
+def excursions(bars, direction, entry, open_dt, close_dt, risk=None):
     """
     Returns dict(mfe, mae, t_mfe_h, t_mae_h, bars_used, last_bar) or None.
     close_dt=None means the trade is still open: use all bars up to the end.
@@ -145,6 +145,7 @@ def excursions(bars, direction, entry, open_dt, close_dt):
         return None
     best_fav = best_adv = 0.0
     t_fav = t_adv = used[0][0]
+    t_half = t_one = None  # first bar that reached +0.5R / +1R (needs a stop)
     for t, high, low in used:
         if direction == "long":
             fav, adv = high - entry, entry - low
@@ -152,6 +153,11 @@ def excursions(bars, direction, entry, open_dt, close_dt):
             fav, adv = entry - low, high - entry
         if fav > best_fav:
             best_fav, t_fav = fav, t
+        if risk:
+            if t_half is None and fav >= 0.5 * risk:
+                t_half = t
+            if t_one is None and fav >= risk:
+                t_one = t
         if adv > best_adv:
             best_adv, t_adv = adv, t
     return {
@@ -160,6 +166,8 @@ def excursions(bars, direction, entry, open_dt, close_dt):
         # the entry bar starts a few seconds before the exact entry time
         "t_mfe_h": max(0.0, (t_fav - open_dt).total_seconds() / 3600),
         "t_mae_h": max(0.0, (t_adv - open_dt).total_seconds() / 3600),
+        "h_to_05r": max(0.0, (t_half - open_dt).total_seconds() / 3600) if t_half else None,
+        "h_to_1r": max(0.0, (t_one - open_dt).total_seconds() / 3600) if t_one else None,
         "bars_used": len(used),
         "last_bar": used[-1][0],
     }
@@ -167,10 +175,11 @@ def excursions(bars, direction, entry, open_dt, close_dt):
 
 def analyse_trade(bars, trade):
     """trade: dict(instrument, direction, entry, open_dt, close_dt|None, exit|None, stop|None)."""
-    ex = excursions(bars, trade["direction"], trade["entry"], trade["open_dt"], trade["close_dt"])
+    entry, stop = trade["entry"], trade.get("stop")
+    ex = excursions(bars, trade["direction"], trade["entry"], trade["open_dt"], trade["close_dt"],
+                    risk=abs(entry - stop) if stop else None)
     if ex is None:
         return None
-    entry, stop = trade["entry"], trade.get("stop")
     out = dict(ex)
     out["mfe_pct"] = ex["mfe"] / entry * 100
     out["mae_pct"] = ex["mae"] / entry * 100
@@ -303,11 +312,13 @@ def main():
 
     with open(args.out, "w", encoding="utf-8", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["trade", "MAE_R", "MFE_R", "MAE_Pct", "MFE_Pct", "capture_pct", "hours_to_MFE", "hours_to_MAE", "Regime", "Trend_Dir"])
+        w.writerow(["trade", "MAE_R", "MFE_R", "MAE_Pct", "MFE_Pct", "capture_pct", "hours_to_MFE", "hours_to_MAE", "Regime", "Trend_Dir", "Hours_to_05R", "Hours_to_1R"])
         for tr, r in results:
             w.writerow([tr["label"], fmt(r["mae_r"]), fmt(r["mfe_r"]), fmt(r["mae_pct"]), fmt(r["mfe_pct"]),
                         fmt(r["capture"] * 100 if r.get("capture") is not None else None, 0),
-                        fmt(r["t_mfe_h"], 1), fmt(r["t_mae_h"], 1), r["regime"], r["trend_dir"]])
+                        fmt(r["t_mfe_h"], 1), fmt(r["t_mae_h"], 1), r["regime"], r["trend_dir"],
+                        fmt(r["h_to_05r"], 1) if r.get("h_to_05r") is not None else "",
+                        fmt(r["h_to_1r"], 1) if r.get("h_to_1r") is not None else ""])
     print(f"\nГотово: {args.out}")
 
 
